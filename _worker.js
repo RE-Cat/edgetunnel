@@ -1,3 +1,54 @@
+// ============================================
+// 限速辅助函数
+// ============================================
+
+function 速率转字节(速率字符串) {
+    const 单位映射 = { 'K': 1024, 'M': 1024*1024, 'G': 1024*1024*1024 };
+    const 匹配 = String(速率字符串 || '').match(/^(\d+)([KMG])?$/i);
+    if (!匹配) return 1024 * 1024;
+    const 数值 = parseInt(匹配[1]);
+    const 单位 = (匹配[2] || 'M').toUpperCase();
+    return 数值 * (单位映射[单位] || 1024*1024);
+}
+
+function IP在CIDR内(IP地址, 网络IP, 前缀长度) {
+    const IP转数字 = (ip) => ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0);
+    const IP掩码 = ~0 >>> (32 - 前缀长度);
+    const IP数值 = IP转数字(IP地址);
+    const 网络数值 = IP转数字(网络IP);
+    return (IP数值 & IP掩码) === (网络数值 & IP掩码);
+}
+
+function 限速响应包装器(响应, 限速速率) {
+    const 限速字节数 = 速率转字节(限速速率);
+    if (!限速字节数) return 响应;
+    
+    const 内容长度 = 响应.headers.get('content-length');
+    if (!内容长度 || parseInt(内容长度) < 限速字节数) return 响应;
+    
+    const { readable, writable } = new TransformStream({
+        async transform(chunk, controller) {
+            let offset = 0;
+            const 块大小 = 1024;
+            const 延迟时间 = 1000 / (限速字节数 / 块大小);
+            
+            while (offset < chunk.length) {
+                const 本次发送 = Math.min(块大小, chunk.length - offset);
+                controller.enqueue(chunk.slice(offset, offset + 本次发送));
+                offset += 本次发送;
+                if (offset < chunk.length) {
+                    await new Promise(resolve => setTimeout(resolve, 延迟时间));
+                }
+            }
+        }
+    });
+    
+    return new Response(响应.body.pipeThrough({ readable, writable }), {
+        status: 响应.status,
+        statusText: 响应.statusText,
+        headers: 响应.headers
+    });
+}
 const Version = '2026-08-11 14:45:22';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
@@ -47,6 +98,52 @@ export default {
 			默认反代兜底 = false;
 		};
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
+// ============================================
+// 限速功能（通过环境变量配置）
+// ============================================
+// 检查是否启用限速
+		if (env.RATE_LIMIT_ENABLE === 'true') {
+			const 限速模式 = env.RATE_LIMIT_MODE || 'blacklist';
+			const 默认限速 = env.RATE_LIMIT_DEFAULT || '1M';
+			const 限速规则 = env.RATE_LIMIT_IPS || '';
+	
+	// 解析限速规则
+			const 规则列表 = 限速规则.split(',').filter(r => r.trim());
+			let 匹配限速 = null;
+	
+			for (const 规则 of 规则列表) {
+				const [ip段, 速率] = 规则.split(':');
+				if (!ip段 || !速率) continue;
+		
+		// 检查IP是否匹配
+				if (ip段.includes('/')) {
+			// CIDR匹配
+					const [网络IP, 前缀] = ip段.split('/');
+					if (IP在CIDR内(访问IP, 网络IP, parseInt(前缀))) {
+						匹配限速 = 速率;
+						break;
+					}
+				} else if (访问IP === ip段) {
+					匹配限速 = 速率;
+					break;
+				}
+			}
+	
+	// 黑名单模式：匹配到的限速
+			if (限速模式 === 'blacklist') {
+				if (匹配限速) {
+			// 需要限速，标记
+					ctx.限速速率 = 匹配限速;
+				}
+			} 
+	// 白名单模式：匹配到的不限速，其他限速
+			else if (限速模式 === 'whitelist') {
+				if (!匹配限速) {
+					ctx.限速速率 = 默认限速;
+			}
+			}
+		}
+// ============================================
 		if (缓存SOCKS5白名单 === null) {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
 			缓存SOCKS5白名单 = SOCKS5白名单;
@@ -291,7 +388,16 @@ export default {
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
 						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
 					} else if (访问路径 === 'admin/cf.json') {// CF配置文件
-						return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						let 响应 = new Response(await nginx(), { 
+    status: 200, 
+    headers: { 'Content-Type': 'text/html; charset=UTF-8' } 
+});
+
+// 如果有限速配置，应用限速
+if (ctx.限速速率) {
+    响应 = 限速响应包装器(响应, ctx.限速速率);
+}
+return 响应;
 					}
 
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
