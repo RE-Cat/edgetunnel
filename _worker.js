@@ -1,7 +1,9 @@
-﻿const Version = '2026-08-11 14:45:22';
+// ============ 导入限速模块 ============
+import * as 限速模块 from './ratelimit.js';
+const Version = '2026-08-11 14:45:22';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
-const Pages静态页面 = 'https://re-cat.github.io/fishtml.pages';
+const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
@@ -47,6 +49,9 @@ export default {
 			默认反代兜底 = false;
 		};
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
+		await 限速.加载限速配置(env);
+		const 限速速率 = 限速.检查限速(访问IP);
+// ===== 限速检查结束 =====
 		if (缓存SOCKS5白名单 === null) {
 			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
 			缓存SOCKS5白名单 = SOCKS5白名单;
@@ -205,7 +210,12 @@ export default {
 					}
 
 					config_JSON = await 读取config_JSON(env, host, userID, UA);
-
+					
+					// 在 admin 路由的 else if 链中添加
+					if (访问路径 === 'admin/ratelimit') {
+						return await 限速.处理限速API(request, env);
+					}
+					
 					if (访问路径 === 'admin/init') {// 重置配置为默认值
 						try {
 							config_JSON = await 读取config_JSON(env, host, userID, UA, true);
@@ -522,9 +532,11 @@ export default {
 				const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
 				return new Response(响应内容, { status: 反代响应.status, headers: { ...Object.fromEntries(反代响应.headers), 'Cache-Control': 'no-store' } });
 			}
-			return 反代响应;
+			return 限速.限速响应包装器(反代响应, 限速速率);
 		} catch (error) { }
-		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		// 改成：
+		let 响应 = new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		return 限速.限速响应包装器(响应, 限速速率);
 	}
 };
 ///////////////////////////////////////////////////////////////////////叉HTTP传输数据///////////////////////////////////////////////
